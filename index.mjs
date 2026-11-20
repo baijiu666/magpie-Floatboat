@@ -367,7 +367,11 @@ export const FloatboatPlugin = async (_ctx = {}, options = {}) => {
         const token = tokenOf(auth)
         if (!token) return { outcome: "failed", message: "Floatboat 未登录" }
         try {
-          const { raw: _raw, ...out } = await claimSignupCredits(token)
+          const { raw: _raw, ...out } = await claimSignupCredits(token, {
+            refreshToken: auth?.refresh,
+            uid: uidOf(auth),
+            log: (m) => console.log(m),
+          })
           return out
         } catch (e) {
           return { outcome: "failed", message: String(e?.message ?? e) }

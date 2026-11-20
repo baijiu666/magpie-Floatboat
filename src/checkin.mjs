@@ -1,85 +1,165 @@
-// src/checkin.mjs —— 领取 Floatboat 的新手积分（首日 200 / 次日 300）
+// src/checkin.mjs —— 新手积分：首日/次日领取 + **到点自动领取**
 //
-// 实测（2026-11-20，本机账号）：POST /api/v1/users/me/newapi/signup-credits/claim
-// 请求体**不需要 day 参数**（{day:1} 与 {} 返回一致），直接 POST {}。
+// 实测（2026-11-21，新账号）：
+//   领取  POST /api/v1/users/me/newapi/signup-credits/claim（body {} 即可，无需 day 参数）
+//   状态  GET  同路径 → {stepKey, status, claimable, amount, startsAt, endsAt, mode}
+//   · 首日 200 自动到账（mode=automatic，status=granted）
+//   · 次日 300 按**注册满 24 小时**开放（不是按自然日）：endsAt 之前 claimable=false
 //
-// 真实响应：{code:0, data:{enqueued, delivered, reason, deliveryError,
-//            creditBalance:{state, remainingCredits, source:"newapi", refreshedAt}}}
-//   · enqueued/delivered = true → 入账了
-//   · reason = "already_processed" → 新手两笔已领完
-//
-// ⚠ 这是「新手首日/次日」两笔奖励，**不是每天刷新的签到**。
-//
-// outcome 用 magpie 契约认的值（docs/contract-alignment.md）：
-//   claimed 领到了 / done 已领过或今天已处理 / inactive 没有签到接口 / failed 失败。
+// 用户要求：到 endsAt **自动领取**，不要用户手动点。所以这里做两件事：
+//   1. checkin 被调用时：可领就领（claimed），不可领就按 endsAt 调度自动领取（inactive）
+//   2. 到点后：定时器自动刷新 token 并打领取接口，用户完全不用管
 
 import { WEB_BASE } from "./config.mjs"
 import { apiFetch } from "./http.mjs"
+import { getSignupCreditClaimStatus } from "./desktop-api.mjs"
 
 const CLAIM_PATH = "/api/v1/users/me/newapi/signup-credits/claim"
+
+/** uid → { timeoutId, endsAtMs }（避免同一账号重复调度） */
+const scheduled = new Map()
 
 function numberOrNull(v) {
   const n = typeof v === "string" ? Number(v) : v
   return typeof n === "number" && Number.isFinite(n) ? n : null
 }
 
+/** 直接打领取接口 */
+async function postClaim(accessToken, signal) {
+  return apiFetch(`${WEB_BASE}${CLAIM_PATH}`, {
+    method: "POST",
+    token: accessToken,
+    json: {},
+    signal,
+    retries: 0,
+  })
+}
+
 /**
- * 领取新手积分。
- * @param {string} accessToken
- * @param {{signal?: AbortSignal}} [o]
+ * 到点自动领取：调度一个定时器到 endsAt，刷新 token 后打领取接口。
+ * 已调度过同账号同时间就不再重复。
  */
-export async function claimSignupCredits(accessToken, { signal } = {}) {
+function scheduleAutoClaim({ accessToken, refreshToken, uid, endsAt, log }) {
+  const endsAtMs = Date.parse(endsAt)
+  if (!Number.isFinite(endsAtMs)) return false
+  const key = String(uid || "default")
+  const prev = scheduled.get(key)
+  if (prev && prev.endsAtMs === endsAtMs) return true // 已经排上了
+
+  if (prev?.timeoutId) clearTimeout(prev.timeoutId)
+  const delay = Math.max(0, endsAtMs - Date.now()) + 2000 // 到点后 +2s 缓冲
+  // Node 的 setTimeout 最长约 24.8 天，这里都在一天内，没问题
+  const timeoutId = setTimeout(async () => {
+    scheduled.delete(key)
+    try {
+      let token = accessToken
+      if (refreshToken) {
+        try {
+          const r = await apiFetch(`${WEB_BASE}/api/desktop/auth/refresh`, {
+            method: "POST",
+            json: { refresh_token: refreshToken },
+            retries: 1,
+          })
+          const d = r?.data ?? r
+          if (d?.access_token) token = d.access_token
+        } catch {}
+      }
+      const res = await postClaim(token)
+      const body = res?.data ?? res
+      log?.(`[floatboat] 次日奖励自动领取：${JSON.stringify(body).slice(0, 120)}`)
+    } catch (e) {
+      log?.(`[floatboat] 次日奖励自动领取失败：${String(e?.message ?? e)}`)
+    }
+  }, delay)
+  // 不阻塞 magpie 退出
+  timeoutId.unref?.()
+  scheduled.set(key, { timeoutId, endsAtMs })
+  return true
+}
+
+/**
+ * 领取新手积分（可领就领；不可领就调度到点自动领）。
+ * @param {string} accessToken
+ * @param {{signal?: AbortSignal, refreshToken?: string, uid?: string, log?: (m:string)=>void}} [o]
+ */
+export async function claimSignupCredits(accessToken, { signal, refreshToken, uid, log } = {}) {
   if (!accessToken) return { outcome: "failed", message: "Floatboat 未登录" }
 
-  let raw
+  // 先查状态：能拿 claimable 和 endsAt
+  let status = null
   try {
-    raw = await apiFetch(`${WEB_BASE}${CLAIM_PATH}`, {
-      method: "POST",
-      token: accessToken,
-      json: {},
-      signal,
-      retries: 0,
-    })
+    status = await getSignupCreditClaimStatus(accessToken, { signal })
   } catch (e) {
     const msg = String(e?.message ?? e)
-    // 业务层报「已经领过」也算 inactive（没有每日签到），不当成登录过期
+    // 业务层报「已经领过」也算 inactive（不是登录过期）
     if (/already|claimed|已领取|重复/i.test(msg)) {
       return { outcome: "inactive", message: "Floatboat 没有每日签到（新手两笔已领完）" }
     }
-    if (e?.status === 404) {
-      return { outcome: "inactive", message: "该账号没有新手积分领取接口" }
-    }
+    // 状态查询就 401：登录已过期，直接失败，不再打第二次（契约：401 不再往下试）
     if (e?.status === 401) {
       return { outcome: "failed", message: "Floatboat 登录已过期，请重新登录", signIn: "expired" }
     }
+    status = null // 状态接口其它错误时退化为直接打领取接口
+  }
+
+  // 可领 → 立即领取
+  if (status?.claimable) {
+    try {
+      const raw = await postClaim(accessToken, signal)
+      const body = raw?.data ?? raw
+      const credit = numberOrNull(body?.creditBalance?.remainingCredits) ?? status.amount
+      return {
+        outcome: "claimed",
+        ...(credit !== null ? { credit } : {}),
+        message: credit !== null ? `领取成功，当前余额 ${credit} 积分` : "领取成功",
+      }
+    } catch (e) {
+      const msg = String(e?.message ?? e)
+      if (/already|claimed|已领取|重复/i.test(msg)) {
+        return { outcome: "inactive", message: "Floatboat 没有每日签到（新手两笔已领完）" }
+      }
+      if (e?.status === 401) return { outcome: "failed", message: "Floatboat 登录已过期", signIn: "expired" }
+      return { outcome: "failed", message: msg }
+    }
+  }
+
+  // 不可领但有 endsAt（次日可领时间）→ 调度到点自动领取
+  if (status?.endsAt) {
+    const ok = scheduleAutoClaim({ accessToken, refreshToken, uid, endsAt: status.endsAt, log })
+    if (ok) {
+      const when = new Date(status.endsAt).toLocaleString("zh-CN", { hour12: false })
+      return {
+        outcome: "inactive",
+        message: `次日 300 积分将于 ${when} 自动领取（注册满 24 小时开放，无需手动操作）`,
+      }
+    }
+  }
+
+  // 状态不可用或没有 endsAt：直接打一次领取接口兜底
+  try {
+    const raw = await postClaim(accessToken, signal)
+    const body = raw?.data ?? raw
+    if (body?.enqueued === true || body?.delivered === true || body?.claimed === true) {
+      const credit =
+        numberOrNull(body?.creditBalance?.remainingCredits) ??
+        numberOrNull(body?.creditsAmount) ??
+        numberOrNull(body?.amount)
+      return { outcome: "claimed", ...(credit !== null ? { credit } : {}), message: "领取成功" }
+    }
+    if (body?.reason === "already_processed") {
+      return { outcome: "inactive", message: "Floatboat 没有每日签到（新手两笔已领完）" }
+    }
+    return { outcome: "inactive", message: String(body?.reason || "当前没有可领取的积分") }
+  } catch (e) {
+    const msg = String(e?.message ?? e)
+    if (/already|claimed|已领取|重复/i.test(msg)) {
+      return { outcome: "inactive", message: "Floatboat 没有每日签到（新手两笔已领完）" }
+    }
+    if (e?.status === 404) return { outcome: "inactive", message: "该账号没有新手积分领取接口" }
+    if (e?.status === 401) return { outcome: "failed", message: "Floatboat 登录已过期", signIn: "expired" }
     return { outcome: "failed", message: msg }
   }
-
-  const body = raw?.data && typeof raw.data === "object" ? raw.data : raw
-
-  // 真的入账了
-  if (body?.enqueued === true || body?.delivered === true || body?.claimed === true) {
-    const credit =
-      numberOrNull(body?.creditBalance?.remainingCredits) ??
-      numberOrNull(body?.creditsAmount) ??
-      numberOrNull(body?.amount)
-    return {
-      outcome: "claimed",
-      ...(credit !== null ? { credit } : {}),
-      message: credit !== null ? `领取成功，当前余额 ${credit} 积分` : "领取成功",
-    }
-  }
-
-  // 已领过 / 今天已处理。
-  // ⚠ Floatboat 没有每日签到（只有新手两笔），已领过时返回 inactive，
-  // 让宿主**隐藏签到入口** —— 不要每天显示「今日已签到」却一分不涨（2026-11-20 截图反馈）。
-  const reason = body?.reason ?? body?.message ?? raw?.message ?? ""
-  if (reason === "already_processed" || /already|claimed|已领取|重复/i.test(String(reason))) {
-    return {
-      outcome: "inactive",
-      message: "Floatboat 没有每日签到（新手首日 200 / 次日 300 已领完）",
-    }
-  }
-
-  return { outcome: "inactive", message: String(reason || "Floatboat 没有每日签到可领") }
 }
+
+/** 给测试用 */
+export const _internal = { scheduled, scheduleAutoClaim }

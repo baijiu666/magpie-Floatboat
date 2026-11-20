@@ -137,3 +137,32 @@ export async function fetchEntitlements(accessToken, { signal } = {}) {
     return null
   }
 }
+
+/**
+ * 查询新手奖励领取状态（GET 与领取同路径）。
+ *
+ * 实测（2026-11-21，新账号）返回：
+ *   {campaignKey, stepKey:"day_1", status:"granted", claimable:false, amount:200,
+ *    mode:"automatic", startsAt, endsAt, title, message, ...}
+ *   · claimable = true  → 现在就能领
+ *   · endsAt           → 下一步（次日 300）的可领时间（注册满 24h，不是按自然日）
+ */
+export async function getSignupCreditClaimStatus(accessToken, { signal } = {}) {
+  const raw = await apiFetch(`${WEB_BASE}/api/v1/users/me/newapi/signup-credits/claim`, {
+    token: accessToken,
+    signal,
+  })
+  const body = unwrap(raw)
+  return {
+    stepKey: typeof body?.stepKey === "string" ? body.stepKey : null,
+    status: typeof body?.status === "string" ? body.status : null,
+    claimable: body?.claimable === true,
+    amount: typeof body?.amount === "number" ? body.amount : null,
+    mode: typeof body?.mode === "string" ? body.mode : null,
+    startsAt: typeof body?.startsAt === "string" ? body.startsAt : null,
+    endsAt: typeof body?.endsAt === "string" ? body.endsAt : null,
+    title: typeof body?.title === "string" ? body.title : null,
+    message: typeof body?.message === "string" ? body.message : null,
+    raw,
+  }
+}
