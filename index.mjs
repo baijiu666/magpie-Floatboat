@@ -58,6 +58,9 @@ export const FloatboatPlugin = async (_ctx = {}, options = {}) => {
     ? Math.max(30_000, Number(options.signInTimeoutMs))
     : 5 * 60_000
   const maxConcurrency = Number.isFinite(options?.maxConcurrency) ? Number(options.maxConcurrency) : 4
+  // 上游会在每条回复尾部追加一段「客户端即将停止维护」的公告（与版本号无关），
+  // 默认剥掉；要原样保留就把这个开关关掉（stripUpstreamNotice=false）。
+  const stripUpstreamNotice = options?.stripUpstreamNotice !== false && String(options?.stripUpstreamNotice) !== "false"
 
   return {
     // ═══ ① 声明 provider 与静态模型表 ══════════════════════════════
@@ -89,6 +92,18 @@ export const FloatboatPlugin = async (_ctx = {}, options = {}) => {
       maxConcurrency,
       // access token 大约 1~2 小时，提前 5 分钟续
       refreshLead: 5 * 60_000,
+
+      // 面板里的开关：上游每条回复尾部都会追加一段客户端维护公告，
+      // 默认剥掉；关掉则原样透传（公告本身与版本号无关，改 UA 消不掉）。
+      options: [
+        {
+          key: "stripUpstreamNotice",
+          label: "剥掉上游的客户端公告",
+          description: "回复结尾那段「客户端即将停止维护」是上游固定追加的。开启时丢弃它，关闭则原样透传。",
+          default: true,
+          placement: "top",
+        },
+      ],
 
       // ═══ ② 登录方式 ══════════════════════════════════════════════
       methods: [
@@ -310,7 +325,7 @@ export const FloatboatPlugin = async (_ctx = {}, options = {}) => {
             const headers = new Headers(init?.headers ?? req?.headers ?? {})
 
             try {
-              return await forwardChat({
+              const upstream = await forwardChat({
                 path: "/chat/completions",
                 method: "POST",
                 body,
@@ -319,6 +334,7 @@ export const FloatboatPlugin = async (_ctx = {}, options = {}) => {
                 getAuth,
                 signal: init?.signal ?? req?.signal,
               })
+              return await rewriteResponse(upstream, { enabled: stripUpstreamNotice })
             } catch (e) {
               const status = e?.status || 502
               const headers2 = { "content-type": "application/json" }
