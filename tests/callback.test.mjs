@@ -24,3 +24,13 @@ test("没有 code 的内容返回 null，不瞎猜", () => {
   assert.equal(parseCallback(""), null)
   assert.equal(parseCallback(null), null)
 })
+
+test("回归：about:blank / chrome:// / 普通 https 链接绝不能被当成裸 code", () => {
+  // 受控浏览器初始页就是 about:blank，若被误判成 code，登录流程会立刻拿假 code 换 token 失败
+  assert.equal(parseCallback("about:blank"), null)
+  assert.equal(parseCallback("chrome://newtab"), null)
+  assert.equal(parseCallback("https://floatboat.ai/desktop-sign-in?state=x"), null)
+  assert.equal(parseCallback("https://floatboat.ai/"), null)
+  // 但真正的裸授权码（手动粘贴）仍要能用
+  assert.equal(parseCallback("rawcode123")?.code, "rawcode123")
+})

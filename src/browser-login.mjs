@@ -315,8 +315,10 @@ const HOOK_SOURCE = `(() => {
 export function parseCallback(raw) {
   const text = String(raw ?? "").trim()
   if (!text) return null
-  // 纯 code（没有 ? / &）：当成 code 用，state 由调用方补
-  if (!/[?&]/.test(text) && !text.includes("://")) {
+  // 纯 code（手动粘贴的裸授权码）：不能含 ? & : 空白，且要有基本长度。
+  // ⚠ 关键：about:blank / chrome://… / 普通 https 链接都含 ":"，绝不能被当成裸 code，
+  // 否则受控浏览器初始页 about:blank 会被误判成授权码，登录流程立刻拿假 code 去换 token。
+  if (!/[?&:\s]/.test(text) && text.length >= 8) {
     return { code: text, state: "", url: "" }
   }
   let url
