@@ -25,22 +25,22 @@ test("领到了 → claimed + credit（契约六值之一）", async () => {
   )
 })
 
-test("上游说已经领过 → done", async () => {
+test("上游说已经领过 → inactive（隐藏签到入口）", async () => {
   await withStubFetch(
     () => json({ code: 0, data: { message: "already claimed" } }),
     async () => {
       const r = await claimSignupCredits("tok")
-      assert.equal(r.outcome, "done")
+      assert.equal(r.outcome, "inactive")
     },
   )
 })
 
-test("业务层报「已经领过」也认成 done，不当成登录过期", async () => {
+test("业务层报「已经领过」也认成 inactive，不当成登录过期", async () => {
   await withStubFetch(
     () => json({ code: -1, message: "signup credit already claimed" }),
     async () => {
       const r = await claimSignupCredits("tok")
-      assert.equal(r.outcome, "done")
+      assert.equal(r.outcome, "inactive")
     },
   )
 })

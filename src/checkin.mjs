@@ -42,9 +42,9 @@ export async function claimSignupCredits(accessToken, { signal } = {}) {
     })
   } catch (e) {
     const msg = String(e?.message ?? e)
-    // 业务层报「已经领过」也算 done，不当成登录过期
+    // 业务层报「已经领过」也算 inactive（没有每日签到），不当成登录过期
     if (/already|claimed|已领取|重复/i.test(msg)) {
-      return { outcome: "done", message: "新手积分已领取过了，没有每日签到" }
+      return { outcome: "inactive", message: "Floatboat 没有每日签到（新手两笔已领完）" }
     }
     if (e?.status === 404) {
       return { outcome: "inactive", message: "该账号没有新手积分领取接口" }
@@ -70,14 +70,16 @@ export async function claimSignupCredits(accessToken, { signal } = {}) {
     }
   }
 
-  // 已领过 / 今天已处理
+  // 已领过 / 今天已处理。
+  // ⚠ Floatboat 没有每日签到（只有新手两笔），已领过时返回 inactive，
+  // 让宿主**隐藏签到入口** —— 不要每天显示「今日已签到」却一分不涨（2026-11-20 截图反馈）。
   const reason = body?.reason ?? body?.message ?? raw?.message ?? ""
   if (reason === "already_processed" || /already|claimed|已领取|重复/i.test(String(reason))) {
     return {
-      outcome: "done",
-      message: "新手积分已领取过了（首日 200 / 次日 300 都已到账），没有每日签到",
+      outcome: "inactive",
+      message: "Floatboat 没有每日签到（新手首日 200 / 次日 300 已领完）",
     }
   }
 
-  return { outcome: "done", message: String(reason || "当前没有可领取的积分") }
+  return { outcome: "inactive", message: String(reason || "Floatboat 没有每日签到可领") }
 }
